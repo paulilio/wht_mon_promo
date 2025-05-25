@@ -1,0 +1,71 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environment
+.python-version
+venv/
+.venv/
+env/
+ENV/
+
+# VS Code settings
+.vscode/
+
+# Pytest cache
+.pytest_cache/
+
+# MyPy cache
+.mypy_cache/
+
+# PyCharm
+.idea/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Arquivos temporários
+*.swp
+*.tmp
+*.bak
+*.orig
+
+# Arquivos de backup
+*_bk/
+*_backup/
+backup/
+
+# Arquivos de teste temporários
+test_output/
+tests_output/
+
+# Arquivos de exportação
+*.zip
+*.tar.gz
+
+# Coverage reports
+htmlcov/
+.coverage
+coverage.xml
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Arquivos específicos do projeto
+log/
+snapshots/
+jobs_test/
+utils/
