@@ -56,3 +56,63 @@ def deduplicar_coleta(coleta):
     print(msg)
     log.write_log('comparador', msg)
     return deduplicados
+
+def comparar_produtos(produtos, produtos_encontrados, tolerancia_perc=10):
+    """
+    Compara produtos encontrados com a lista de produtos esperados.
+
+    Para cada produto esperado, verifica se:
+    - O título encontrado contém todos os termos esperados.
+    - O título NÃO contém o termo proibido.
+    - O preço está dentro da faixa de tolerância.
+
+    Args:
+        produtos (list): Lista de produtos a comparar.
+                         Cada item: [nome, termos_str, proibido, valor_medio]
+        produtos_encontrados (list): Lista de dicionários com 'titulo' e 'preco'.
+        tolerancia_perc (float): Porcentagem de tolerância no preço.
+
+    Returns:
+        list: Lista de dicionários com produtos que atenderam aos critérios.
+    """
+    resultados = []
+
+    for nome, termos_str, proibido, valor_medio in produtos:
+        termos = termos_str.lower().split()
+        proibido = proibido.lower().strip()
+
+        for prod in produtos_encontrados:
+            titulo = prod['titulo'].lower()
+            preco = prod['preco']
+
+            # Verifica se contém "18x" no título
+            if "18x" not in titulo:
+                continue
+
+            # Verifica se todos os termos esperados estão presentes no título
+            if not all(t in titulo for t in termos):
+                continue
+
+            # Verifica se o termo proibido NÃO está no título
+            if proibido and proibido in titulo:
+                continue
+
+            # Verifica se o preço está dentro da tolerância
+            tolerancia = valor_medio * (tolerancia_perc / 100)
+            if abs(preco - valor_medio) > tolerancia:
+                continue
+
+            # Produto atende a todas as condições
+            resultado = {
+                "produto": nome,
+                "termos_encontrados": termos,
+                "preco": preco,
+                "parcela_18x": round(preco / 18, 2)
+            }
+            resultados.append(resultado)
+
+    msg = f"✅ Comparação finalizada: {len(resultados)} produtos encontrados conforme critérios."
+    print(msg)
+    log.write_log('comparador', msg)
+
+    return resultados

@@ -1,25 +1,27 @@
-# Projeto wht_mon_promo
-Gerado pelo script de inicialização: `setup/init.sh`
+# Mercado Livre Scraper
 
-## Estrutura do Projeto
+Automação para coleta de preços de produtos no Mercado Livre, com comparação de históricos e envio de alertas via WhatsApp e Google Drive.
 
-- `jobs/` → tarefas programadas e execução
-- `mon/` → monitoramento de páginas web
-- `notif/` → envio de mensagens via WhatsApp
-- `main.py` → inicializador principal
-- `requirements.txt` → dependências do projeto
+## 🎯 Funcionalidades
 
-## Descrição
+- Coleta automática de produtos com parcela de 18x.
+- Classificação automática de produtos.
+- Comparação de preços atual x anterior.
+- Geração de relatórios em JSON, HTML e PDF.
+- Envio automático para Google Drive.
+- Notificações via WhatsApp.
 
-Projeto para monitoramento automático de páginas web e envio de alertas via WhatsApp.
+---
 
-## Como rodar
+## 🚀 Como executar
 
-1. Configure suas credenciais no módulo `notif/wht_send.py`.
-2. Execute o monitoramento via:
+### **Pré-requisitos:**
+- Python 3.8+
+- Google Chrome instalado
+- Ferramenta `rclone` configurada para acesso ao Google Drive
+- Configurar variáveis no `.env` (exemplo abaixo)
 
-  ```bash
-  python main.py
-  ```
+### **Instalação de dependências:**
 
-ou agende via sistema operacional.
+```bash
+pip install -r requirements.txt
