@@ -13,6 +13,17 @@ venv/
 env/
 ENV/
 
+# Firebase service account key
+services/firebase/serviceAccountKey.json
+
+# Firebase emuladores (opcional)
+firebase-debug.log
+.firebaserc
+
+# Logs
+*.log
+*.out
+
 # VS Code settings
 .vscode/
 

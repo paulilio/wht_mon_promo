@@ -28,6 +28,9 @@ from bs4 import BeautifulSoup
 from mon import cupons_aplicador
 from notify import wht_send
 from common import log, env
+from services.firebase.firebase_service import inserir_codigo, carregar_base
+import firebase_admin
+from firebase_admin import credentials, storage
 
 # =================== CONSTANTES ===================
 
@@ -42,7 +45,13 @@ CLASSIFICACAO = {
                 "sem_combo_keywords": ["mini sem ams", "mini sem combo", "pf002", "alta performance"]},
     "A1": {"combo_keywords": ["combo", "ams", "multicolor"],
            "sem_combo_keywords": ["sem ams", "sem combo", "fdm", "pf002", "pf001", "alta performance", "aberta"]},
-    "P1S": {"combo_keywords": ["p1s combo", "p1s ams"], "sem_combo_keywords": ["p1s sem ams", "p1s -", "p1s"]},
+    "P1S": {
+    "combo_keywords": [
+        "p1s combo", "p1s com ams", "p1s + ams", "p1s ams", "p1s multicolor", "p1s com sistema", "p1s com suporte", "p1s combo ams"
+    ],
+    "sem_combo_keywords": [
+        "p1s sem ams", "p1s sem combo", "p1s somente", "p1s s/ ams", "p1s fdm", "p1s pf001-u"
+    ]},
     "P1P": {"keywords": ["p1p"]},
     "Outros": {"exclusoes": ["filamento", "sistema automático", "suporte", "curso", "brinde"]}
 }
@@ -83,7 +92,7 @@ def main():
             cupons_aplicador.aplicar_cupons(driver)
 
         produtos = coletar_produtos(driver, args.url)
-        enriquecer_com_vl_desc(driver, produtos)
+        #enriquecer_com_vl_desc(driver, produtos)
         caminho_json = salvar_json(produtos, nome_arquivo='mercadolivre_informatica')
 
         caminho_anterior = os.path.join(BASE_DIR, 'ml_scraper_v2', 'ultimo.json')
@@ -96,18 +105,52 @@ def main():
         shutil.copy(caminho_json, caminho_anterior)
 
         #if not args.nowhats: enviar_resumo_whatsapp_tabela(produtos)
-        enviar_resumo_whatsapp_classificacoes(produtos)
+        #enviar_resumo_whatsapp_classificacoes(produtos)
 
+        caminho_html = salvar_html(produtos, nome_arquivo='mercadolivre')
+        print(caminho_html)
+        #link_publico = upload_html_to_storage(caminho_html)
+        #enviar_para_google_drive(link_publico)
+
+        '''
         caminho_pdf = salvar_pdf(produtos, nome_arquivo='mercadolivre_informatica')
         if caminho_pdf:
             link_pdf = enviar_para_google_drive(caminho_pdf)
             if link_pdf:
                 if not args.nowhats: enviar_link_whatsapp(link_pdf)
-
+        '''
     finally:
         driver.quit()
 
 # =================== UTILITÁRIOS ===================
+
+def upload_html_to_storage(local_file_path, remote_file_name=None):
+    # Caminho absoluto para a credencial na pasta services/firebase
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cred_path = os.path.join(base_dir, 'services', 'firebase', 'serviceAccountKey.json')
+
+    # Inicializa app Firebase se não estiver inicializado
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred, {
+            'storageBucket': '<BUCKET_NAME>.appspot.com'
+        })
+
+    bucket = storage.bucket()
+
+    if not remote_file_name:
+        remote_file_name = os.path.basename(local_file_path)
+
+    blob = bucket.blob(remote_file_name)
+    blob.upload_from_filename(local_file_path, content_type='text/html')
+
+    # Torna o arquivo público
+    blob.make_public()
+
+    print(f"Arquivo {remote_file_name} enviado para Storage.")
+    print(f"Link público: {blob.public_url}")
+
+    return blob.public_url
 
 def aguardar_login(driver):
     print("[INFO] Verificando se está logado no Mercado Livre...")
@@ -142,10 +185,16 @@ def extrair_codigo_para_link(link):
     match = re.search(r"(MLB\d+)(?!\d)", link)
     return f"https://www.mercadolivre.com.br/p/{match.group(1)}" if match else ''
 
-def deve_ignorar(titulo, preco):
-    return any(item['produto'].lower() == titulo.lower() for item in IGNORADOS)
+def deve_ignorar(titulo, preco, codigo=None):
+    if codigo and codigo in IGNORED_FIREBASE:
+        return True
+    return any(item['produto'].lower() == titulo.lower() for item in IGNORADOS_LOCAIS)
 
-def classificar_produto(titulo):
+def classificar_produto(titulo, codigo=None, classificacoes_externas=None):
+    if classificacoes_externas and codigo in classificacoes_externas:
+        classificacao_manual = classificacoes_externas[codigo].get('classificacao', "Não Classificado")
+        return "A1 Sem Combo" if classificacao_manual == "A1" else classificacao_manual
+
     titulo_lower = titulo.lower()
 
     if 'mini' in titulo_lower:
@@ -158,17 +207,15 @@ def classificar_produto(titulo):
 
     for categoria in ["P1P", "P1S", "A1"]:
         regras = CLASSIFICACAO.get(categoria, {})
-        if any(kw in titulo_lower for kw in regras.get("sem_combo_keywords", [])):
-            return f"{categoria} Sem Combo"
         if any(kw in titulo_lower for kw in regras.get("combo_keywords", [])):
             return f"{categoria} Combo"
+        if any(kw in titulo_lower for kw in regras.get("sem_combo_keywords", [])):
+            return f"{categoria} Sem Combo"
         if any(kw in titulo_lower for kw in regras.get("keywords", [])):
-            return categoria
+            return "A1 Sem Combo" if categoria == "A1" else categoria
 
     if "a1" in titulo_lower:
-        if any(kw in titulo_lower for kw in CLASSIFICACAO["A1"]["sem_combo_keywords"]):
-            return "A1 Sem Combo"
-        return "A1"
+        return "A1 Sem Combo"
 
     if any(ex in titulo_lower for ex in CLASSIFICACAO["Outros"]["exclusoes"]):
         return "Outros"
@@ -237,8 +284,9 @@ def wait_for_products(driver):
         log_and_print("⚠️ Timeout ao esperar itens na página.")
         return False
 
-def parse_products(driver, consolidado):
+def parse_products(driver, consolidado, ignorados_firebase, classificacoes_firebase):
     soup = BeautifulSoup(driver.page_source, 'html.parser')
+    
     for item in soup.select('.ui-search-layout__item'):
         titulo_tag = item.select_one('.poly-component__title-wrapper .poly-component__title')
         preco_tag = item.select_one('.poly-price__current .andes-money-amount__fraction')
@@ -294,12 +342,18 @@ def parse_products(driver, consolidado):
 
         try:
             preco = float(preco_str)
-            if deve_ignorar(titulo, preco):
+            
+            # Ajuste: verificar na base de ignorados (com e sem traço)
+            codigo_sem_traco = codigo.replace('-', '') if codigo != "-" else "-"
+            
+            if (codigo in ignorados_firebase) or (codigo_sem_traco in ignorados_firebase):
+                print(f"[INFO] Ignorando produto {codigo} conforme base remota.")
                 continue
+
             if titulo not in consolidado or preco < consolidado[titulo]['preco']:
                 consolidado[titulo] = {
                     "preco": preco,
-                    "classificacao": classificar_produto(titulo),
+                    "classificacao": classificar_produto(titulo, codigo, classificacoes_firebase),
                     "possui_18x": possui_18x,
                     "valor_parcela": valor_parcela,
                     "cupom": cupom,
@@ -309,11 +363,14 @@ def parse_products(driver, consolidado):
                 }
         except ValueError:
             continue
-    time.sleep(random.uniform(3.5, 5.0))  # Leve atraso entre produtos
 
+    time.sleep(random.uniform(3.5, 5.0))  # Leve atraso entre produtos
 
 def coletar_produtos(driver, url):
     consolidado = {}
+    ignorados_firebase = carregar_base('ignore')
+    classificacoes_firebase = carregar_base('classification')
+
     driver.get(url)
     time.sleep(random.uniform(2.5, 4.5))  # Aguarda após carregamento inicial
 
@@ -321,7 +378,7 @@ def coletar_produtos(driver, url):
         time.sleep(random.uniform(2, 4))  # Aguarda antes de processar página
         if not wait_for_products(driver):
             break
-        parse_products(driver, consolidado)
+        parse_products(driver, consolidado, ignorados_firebase, classificacoes_firebase)
         time.sleep(random.uniform(1.5, 3.5))  # Aguarda entre a análise e clique
         if not find_seguinte_button(driver) or not click_next_page(driver):
             break
@@ -376,31 +433,54 @@ def salvar_json(produtos, nome_arquivo='resultado'):
     print(f"Arquivo JSON salvo em: {caminho}")
     return caminho
 
+def salvar_pdf(produtos, nome_arquivo='resultado'):
+    caminho_html = salvar_html(produtos, nome_arquivo)
+    caminho_pdf = caminho_html.replace('.html', '.pdf')
+    try:
+        pdfkit.from_file(caminho_html, caminho_pdf, options={'enable-local-file-access': ''})
+        print(f"Arquivo PDF salvo em: {caminho_pdf}")
+        return caminho_pdf
+    except Exception as e:
+        print(f"Erro ao gerar PDF: {e}")
+        return None
+
 def salvar_html(produtos, nome_arquivo='resultado'):
-    from jinja2 import Template
-    pasta = os.path.join(BASE_DIR, 'ml_scraper_v2')
+    pasta = os.path.join('snapshots', 'ml_scraper_v2')
     os.makedirs(pasta, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     caminho = os.path.join(pasta, f"{nome_arquivo}_{timestamp}.html")
 
     agrupado = defaultdict(list)
-    for produto, info in produtos.items():
-        valor_parcela_str = str(info.get('valor_parcela', '0.00')).replace('R$', '').replace(',', '.').strip()
-        try:
-            valor_parcela_num = float(valor_parcela_str)
-        except ValueError:
-            valor_parcela_num = 0.0
 
-        agrupado[info.get('classificacao', 'Não Classificado')].append({
+    for produto, info in produtos.items():
+        codigo = info.get('codigo', '-')
+        classificacao = info.get('classificacao', 'Não Classificado')
+        if classificacao == "A1":
+            classificacao = "A1 Sem Combo"
+
+        if codigo != '-':
+            link_ignorar = f'<button onclick="adicionarIgnore(\'{codigo}\')">Ign</button>'
+            link_classificar = f'<button onclick="abrirClassificacaoModal(\'{codigo}\')">Classificar</button>'
+        else:
+            link_ignorar = '-'
+            link_classificar = '-'
+
+        valor_parcela_str = info.get('valor_parcela', '-').replace('.', '').replace(',', '.')
+        try:
+            valor_parcela_float = float(valor_parcela_str)
+        except ValueError:
+            valor_parcela_float = float('inf')
+
+        agrupado[classificacao].append({
             "Produto": produto,
-            "Código": info.get('codigo', '-'),
+            "Código": codigo,
             "Menor Preço": f"{info.get('preco', 0):.2f}",
-            "Valor Parcela": info.get('valor_parcela', '-'),
-            "Valor Parcela Num": valor_parcela_num,
-            "Desc.": info.get('cupom', '-'),
-            "VL Desc": info.get('vl_desc', '-'),
-            "Possui 18x": 'Sim' if info.get('possui_18x', False) else 'Não',
-            "Link": f'<a href="{info.get("link", "#")}" target="_blank">Ver Produto</a>'
+            "Desconto": info.get('cupom', '-'),
+            "Valor da Parcela": info.get('valor_parcela', '-'),
+            "Valor Float": valor_parcela_float,
+            "Link": f'<a href="{info.get("link", "#")}" target="_blank">Ver Produto</a>',
+            "Ignorar": link_ignorar,
+            "Classificar": link_classificar
         })
 
     tabelas_html = ""
@@ -408,11 +488,8 @@ def salvar_html(produtos, nome_arquivo='resultado'):
         if not itens:
             continue
         df = pd.DataFrame(itens)
-        if 'Valor Parcela Num' in df.columns:
-            df = df.sort_values(by=["Valor Parcela Num", "Produto"])
-            df = df.drop(columns=["Valor Parcela Num"])
-        else:
-            df = df.sort_values(by=["Produto"])
+        df = df.sort_values(by=["Valor Float"])
+        df = df.drop(columns=["Valor Float"])
         tabela_html = df.to_html(escape=False, index=False)
         tabelas_html += f"<h2>{classe}</h2>{tabela_html}"
 
@@ -429,32 +506,86 @@ def salvar_html(produtos, nome_arquivo='resultado'):
             table { border-collapse: collapse; width: 100%; margin-bottom: 30px; }
             th, td { border: 1px solid #ddd; padding: 8px; }
             th { background-color: #f2f2f2; }
+            button { padding: 5px 10px; background-color: #007BFF; color: white; border: none; border-radius: 4px; cursor: pointer; }
+            button:hover { background-color: #0056b3; }
         </style>
     </head>
     <body>
         <h1>Tabelas por Classificação</h1>
         {{ tabelas | safe }}
+
+        <div id="modalClassificacao" style="display:none; position:fixed; top:30%; left:40%; background:white; padding:20px; border:1px solid #ccc; z-index:9999;">
+            <h3>Selecionar classificação:</h3>
+            <select id="selectClassificacao">
+                <option value="">-- Escolha --</option>
+                <option value="P1S Combo">P1S Combo</option>
+                <option value="P1S Sem Combo">P1S Sem Combo</option>
+                <option value="P1P">P1P</option>
+                <option value="A1 Sem Combo">A1 Sem Combo</option>
+                <option value="A1 Mini Combo">A1 Mini Combo</option>
+                <option value="A1 Mini Sem Combo">A1 Mini Sem Combo</option>
+                <option value="Outros">Outros</option>
+                <option value="Não Classificado">Não Classificado</option>
+            </select>
+            <br/><br/>
+            <button onclick="salvarClassificacao()">Salvar</button>
+            <button onclick="fecharModal()">Cancelar</button>
+        </div>
+
+        <script>
+        let codigoSelecionado = "";
+
+        function abrirClassificacaoModal(codigo) {
+            codigoSelecionado = codigo;
+            document.getElementById('modalClassificacao').style.display = 'block';
+        }
+
+        function fecharModal() {
+            document.getElementById('modalClassificacao').style.display = 'none';
+            codigoSelecionado = "";
+        }
+
+        function salvarClassificacao() {
+            const classificacao = document.getElementById('selectClassificacao').value;
+            if (!classificacao || !codigoSelecionado) return;
+
+            fetch(`https://wht-ml-scraper-default-rtdb.firebaseio.com/whtbase/classification/${codigoSelecionado}.json`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ classificacao: classificacao })
+            })
+            .then(res => res.json())
+            .then(data => {
+                alert('Classificação salva para ' + codigoSelecionado + ': ' + classificacao);
+                fecharModal();
+            })
+            .catch(err => {
+                alert('Erro ao salvar: ' + err);
+            });
+        }
+
+        function adicionarIgnore(codigo) {
+            fetch(`https://wht-ml-scraper-default-rtdb.firebaseio.com/whtbase/ignore/${codigo}.json`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ motivo: 'Adicionado via HTML' })
+            })
+            .then(res => res.json())
+            .then(data => alert('Código ' + codigo + ' adicionado com sucesso!'))
+            .catch(err => alert('Erro ao adicionar: ' + err));
+        }
+        </script>
     </body>
     </html>
     """)
 
     html_content = template.render(tabelas=tabelas_html)
+
     with open(caminho, 'w', encoding='utf-8') as f:
         f.write(html_content)
 
     print(f"Arquivo HTML salvo em: {caminho}")
     return caminho
-
-def salvar_pdf(produtos, nome_arquivo='resultado'):
-    caminho_html = salvar_html(produtos, nome_arquivo)
-    caminho_pdf = caminho_html.replace('.html', '.pdf')
-    try:
-        pdfkit.from_file(caminho_html, caminho_pdf, options={'enable-local-file-access': ''})
-        print(f"Arquivo PDF salvo em: {caminho_pdf}")
-        return caminho_pdf
-    except Exception as e:
-        print(f"Erro ao gerar PDF: {e}")
-        return None
 
 # =================== COMUNICAÇÃO ===================
 

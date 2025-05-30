@@ -25,3 +25,5 @@ Automação para coleta de preços de produtos no Mercado Livre, com comparaçã
 
 ```bash
 pip install -r requirements.txt
+
+
