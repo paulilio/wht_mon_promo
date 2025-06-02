@@ -13,12 +13,14 @@ venv/
 env/
 ENV/
 
-# Firebase service account key
-services/firebase/serviceAccountKey.json
+*.session
 
 # Firebase emuladores (opcional)
 firebase-debug.log
 .firebaserc
+
+secrets/
+*.json
 
 # Logs
 *.log
@@ -80,3 +82,4 @@ log/
 snapshots/
 jobs_test/
 utils/
+services/telegram/test.py

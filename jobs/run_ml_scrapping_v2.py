@@ -24,13 +24,16 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
+import firebase_admin
+from datetime import datetime
+from collections import defaultdict
+
 
 from mon import cupons_aplicador
 from notify import wht_send
 from common import log, env
-from services.firebase.firebase_service import inserir_codigo, carregar_base
-import firebase_admin
-from firebase_admin import credentials, storage
+from services.firebase.firebase_service import atualizar_produto_firebase, marcar_inativos, carregar_base
+from datetime import datetime
 
 # =================== CONSTANTES ===================
 
@@ -41,6 +44,12 @@ IMAGENS_DIR = os.path.join(BASE_DIR, 'images')
 os.makedirs(IMAGENS_DIR, exist_ok=True)
 
 CLASSIFICACAO = carregar_base('class_config')
+
+IGNORADOS = [
+    {"produto": "Impressora 3d Bambu Lab A1 Mini (sem Ams) Cor Branco 127/220v", "preco": 2.499},
+    {"produto": "Ams Sistema Automático De Materiais P1s - X1c", "preco": 4650.00},
+    {"produto": "Bambu Lab Ams Sa001 Sistema Automático De Materiais P1s X1c", "preco": 4650.00}
+]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -63,7 +72,6 @@ def main():
     args = parser.parse_args()
 
     driver = setup_driver(silent=args.silent)
-    #aguardar_login(driver)
     try:
         if args.apenas_cupons:
             cupons_aplicador.aplicar_cupons(driver)
@@ -72,65 +80,35 @@ def main():
             cupons_aplicador.aplicar_cupons(driver)
 
         produtos = coletar_produtos(driver, args.url)
-        #enriquecer_com_vl_desc(driver, produtos)
-        caminho_json = salvar_json(produtos, nome_arquivo='mercadolivre_informatica')
+        enriquecer_com_vl_desc(driver, produtos)
+        codigos_encontrados = set()
 
-        caminho_anterior = os.path.join(BASE_DIR, 'ml_scraper_v2', 'ultimo.json')
-        if os.path.exists(caminho_anterior):
-            json_atual = carregar_json(caminho_json)
-            json_anterior = carregar_json(caminho_anterior)
-            msg_comp = comparar_precos(json_atual, json_anterior)
-            if not args.nowhats: wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, msg_comp)
+        # ✅ Atualiza cada produto no Firebase
+        for nome_produto, info in produtos.items():
+            codigo = info.get("codigo")
+            codigos_encontrados.add(codigo)
 
-        shutil.copy(caminho_json, caminho_anterior)
+            atualizar_produto_firebase(codigo, {
+                "produto": nome_produto,
+                "classificacao": info.get("classificacao"),
+                "preco": info.get("preco"),
+                "valor_parcela": info.get("valor_parcela"),
+                "valor_desc": info.get("vl_desc"),
+                "valor_parc_real": info.get("valor_parc_real"),
+                "cupom": info.get("cupom"),
+                "link": info.get("link"),
+                "link_reduzido": info.get("link_reduzido")
+            })
 
-        #if not args.nowhats: enviar_resumo_whatsapp_tabela(produtos)
-        #enviar_resumo_whatsapp_classificacoes(produtos)
+        # ✅ Marca como inativos os produtos que não foram encontrados nesta coleta
+        marcar_inativos(codigos_encontrados)
 
-        caminho_html = salvar_html(produtos, nome_arquivo='mercadolivre')
-        print(caminho_html)
-        #link_publico = upload_html_to_storage(caminho_html)
-        #enviar_para_google_drive(link_publico)
+        enviar_resumo_whatsapp_parcelas(produtos)
 
-        '''
-        caminho_pdf = salvar_pdf(produtos, nome_arquivo='mercadolivre_informatica')
-        if caminho_pdf:
-            link_pdf = enviar_para_google_drive(caminho_pdf)
-            if link_pdf:
-                if not args.nowhats: enviar_link_whatsapp(link_pdf)
-        '''
+        print("[OK] Coleta finalizada, Firebase atualizado e produtos inativos marcados.")
+
     finally:
         driver.quit()
-
-# =================== UTILITÁRIOS ===================
-
-def upload_html_to_storage(local_file_path, remote_file_name=None):
-    # Caminho absoluto para a credencial na pasta services/firebase
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cred_path = os.path.join(base_dir, 'services', 'firebase', 'serviceAccountKey.json')
-
-    # Inicializa app Firebase se não estiver inicializado
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred, {
-            'storageBucket': '<BUCKET_NAME>.appspot.com'
-        })
-
-    bucket = storage.bucket()
-
-    if not remote_file_name:
-        remote_file_name = os.path.basename(local_file_path)
-
-    blob = bucket.blob(remote_file_name)
-    blob.upload_from_filename(local_file_path, content_type='text/html')
-
-    # Torna o arquivo público
-    blob.make_public()
-
-    print(f"Arquivo {remote_file_name} enviado para Storage.")
-    print(f"Link público: {blob.public_url}")
-
-    return blob.public_url
 
 def aguardar_login(driver):
     print("[INFO] Verificando se está logado no Mercado Livre...")
@@ -160,10 +138,6 @@ def get_random_user_agent():
 def log_and_print(message, label='web_mon'):
     print(message)
     log.write_log(label, message)
-
-def extrair_codigo_para_link(link):
-    match = re.search(r"(MLB\d+)(?!\d)", link)
-    return f"https://www.mercadolivre.com.br/p/{match.group(1)}" if match else ''
 
 def deve_ignorar(titulo, preco, codigo=None):
     if codigo and codigo in IGNORED_FIREBASE:
@@ -203,6 +177,42 @@ def classificar_produto(titulo, codigo=None, classificacoes_externas=None):
     return "Não Classificado"
 
 # =================== COLETA ===================
+
+def atualizar_produtos_firebase(produtos):
+    base_antiga = carregar_base("products")
+    data_coleta = datetime.now().isoformat()
+    nova_base = {}
+
+    for nome, info in produtos.items():
+        codigo = info.get("codigo", "sem_codigo")
+        preco = round(info["preco"], 2)
+        valor_parcela = info.get("valor_parcela", "-")
+        classificacao = info.get("classificacao", "Não Classificado")
+        historico = base_antiga.get(codigo, {}).get("historico", [])
+        preco_antigo = round(base_antiga.get(codigo, {}).get("preco", 0), 2)
+        valor_antigo = base_antiga.get(codigo, {}).get("valor_parcela", "-")
+
+        if preco != preco_antigo or valor_parcela != valor_antigo:
+            historico.insert(0, {
+                "data": base_antiga.get(codigo, {}).get("ultima_coleta", data_coleta),
+                "preco": preco_antigo,
+                "valor_parcela": valor_antigo
+            })
+
+        historico = historico[:25]
+
+        nova_base[codigo] = {
+            "produto": nome,
+            "classificacao": classificacao,
+            "preco": preco,
+            "valor_parcela": valor_parcela,
+            "ultima_coleta": data_coleta,
+            "ativo": True,
+            "historico": historico
+        }
+
+    for codigo, dados in nova_base.items():
+        inserir_codigo("products", codigo, dados)
 
 def setup_driver(silent=False):
     options = Options()
@@ -301,18 +311,12 @@ def parse_products(driver, consolidado, ignorados_firebase, classificacoes_fireb
 
         codigo = "-"
         link_reduzido = link
-
         title_wrapper = item.select_one('.poly-component__title-wrapper a')
         if title_wrapper:
             href = title_wrapper.get('href', '')
-            # Caso 1: wid=MLB...
-            match = re.search(r'wid=(MLB\d+)&?', href)
-            if not match:
-                # Caso 2: p/MLB...
-                match = re.search(r'p/(MLB\d+)\?', href)
-            if not match:
-                # Caso 3: /MLB-123456...
-                match = re.search(r'/((MLB-\d+))', href)
+            match = re.search(r'wid=(MLB\d+)&?', href) or \
+                    re.search(r'p/(MLB\d+)\?', href) or \
+                    re.search(r'/((MLB-\d+))', href)
             if match:
                 codigo = match.group(1)
                 if '-' in codigo:
@@ -322,34 +326,37 @@ def parse_products(driver, consolidado, ignorados_firebase, classificacoes_fireb
 
         try:
             preco = float(preco_str)
-            
-            # Ajuste: verificar na base de ignorados (com e sem traço)
             codigo_sem_traco = codigo.replace('-', '') if codigo != "-" else "-"
-            
             if (codigo in ignorados_firebase) or (codigo_sem_traco in ignorados_firebase):
                 print(f"[INFO] Ignorando produto {codigo} conforme base remota.")
+                continue
+
+            if not possui_18x:
+                print(f"[INFO] Ignorando {titulo} pois não possui 18x.")
                 continue
 
             if titulo not in consolidado or preco < consolidado[titulo]['preco']:
                 consolidado[titulo] = {
                     "preco": preco,
                     "classificacao": classificar_produto(titulo, codigo, classificacoes_firebase),
-                    "possui_18x": possui_18x,
+                    "possui_18x": True,
                     "valor_parcela": valor_parcela,
                     "cupom": cupom,
                     "codigo": codigo,
                     "link": link,
-                    "link_reduzido": link_reduzido
+                    "link_reduzido": link_reduzido,
+                    "vl_desc": "-",
+                    "valor_parc_real": "-"
                 }
         except ValueError:
             continue
 
-    time.sleep(random.uniform(3.5, 5.0))  # Leve atraso entre produtos
+    time.sleep(random.uniform(3.5, 5.0))
 
 def coletar_produtos(driver, url):
     consolidado = {}
     ignorados_firebase = carregar_base('ignore')
-    classificacoes_firebase = carregar_base('classification')
+    classificacoes_firebase = carregar_base('class_prod')
 
     driver.get(url)
     time.sleep(random.uniform(2.5, 4.5))  # Aguarda após carregamento inicial
@@ -367,31 +374,66 @@ def coletar_produtos(driver, url):
     return consolidado
 
 def enriquecer_com_vl_desc(driver, produtos):
-    for produto, info in produtos.items():
-        if info.get('cupom', '-') == '-':
-            produtos[produto]['vl_desc'] = "-"
-            continue
+    from collections import defaultdict
+    import re
 
-        link = info.get('link')
-        if not link:
-            produtos[produto]['vl_desc'] = "-"
-            continue
+    classificados = defaultdict(list)
 
-        try:
-            driver.get(link)
-            time.sleep(random.uniform(2.5, 4.5))  # Aguarda carregamento da página
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            label = soup.select_one('div.ui-vpp-coupons-awareness label')
-            if label:
-                vl_desc = label.get_text(strip=True)
-            else:
-                vl_desc = "-"
-            produtos[produto]['vl_desc'] = vl_desc
-            print(f"[INFO] vl_desc capturado para: {produto} → {vl_desc}")
-        except Exception as e:
-            print(f"[ERRO] Falha ao capturar vl_desc para: {produto} → {e}")
-            produtos[produto]['vl_desc'] = "-"
-        time.sleep(random.uniform(1.5, 3.5))  # Aguarda entre visitas aos produtos
+    # Agrupa produtos com classificação válida
+    for nome_produto, info in produtos.items():
+        classificacao = info.get('classificacao', '').strip()
+        if not classificacao or classificacao in ['Outros', 'Não Classificado']:
+            continue
+        classificados[classificacao].append((nome_produto, info))
+
+    total_enriquecidos = 0
+    print("\n[INFO] Iniciando enriquecimento de vl_desc para produtos com valor de desconto...\n")
+
+    for classificacao, grupo in classificados.items():
+        grupo_ordenado = sorted(grupo, key=lambda x: x[1].get('preco', float('inf')))
+        top7 = grupo_ordenado[:7]
+        print(f"🔎 Classificação '{classificacao}': processando {len(top7)} produtos...")
+
+        for nome_produto, info in top7:
+            link = info.get('link')
+            if not link:
+                produtos[nome_produto]['vl_desc'] = "-"
+                produtos[nome_produto]['valor_parc_real'] = "-"
+                continue
+
+            try:
+                driver.get(link)
+                time.sleep(random.uniform(2.5, 4.5))
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+                label = soup.select_one('div.ui-vpp-coupons-awareness label')
+                vl_desc = label.get_text(strip=True) if label else "-"
+                produtos[nome_produto]['vl_desc'] = vl_desc
+
+                # Tenta extrair valor numérico do vl_desc (com ou sem "R$")
+                match_real = re.search(r'([\d]{2,4}(?:[\.,]\d{2})?)', vl_desc)
+                if match_real:
+                    desconto_str = match_real.group(1).replace('.', '').replace(',', '.')
+                    try:
+                        desconto_valor = float(desconto_str)
+                        valor_parc_real = round((info['preco'] - desconto_valor) / 18, 2)
+                        produtos[nome_produto]['valor_parc_real'] = valor_parc_real
+                        print(f"   ✅ {nome_produto} → vl_desc: {vl_desc} | Parcela Real: R$ {valor_parc_real:.2f}")
+                        total_enriquecidos += 1
+                    except ValueError:
+                        produtos[nome_produto]['valor_parc_real'] = "-"
+                        print(f"   ⚠️ Erro ao converter valor de desconto → {nome_produto}")
+                else:
+                    produtos[nome_produto]['valor_parc_real'] = "-"
+                    print(f"   ℹ️ Nenhum valor numérico encontrado no vl_desc → {nome_produto}: {vl_desc}")
+
+            except Exception as e:
+                produtos[nome_produto]['vl_desc'] = "-"
+                produtos[nome_produto]['valor_parc_real'] = "-"
+                print(f"   ❌ {nome_produto} → ERRO: {e}")
+            time.sleep(random.uniform(1.5, 3.5))
+
+    print(f"\n[RESUMO] Total de classificações processadas: {len(classificados)}")
+    print(f"[RESUMO] Total de produtos enriquecidos com vl_desc e valor_parc_real: {total_enriquecidos}\n")
 
 # =================== SALVAMENTO ===================
 
@@ -413,7 +455,6 @@ def salvar_json(produtos, nome_arquivo='resultado'):
     print(f"Arquivo JSON salvo em: {caminho}")
     return caminho
 
-def salvar_pdf(produtos, nome_arquivo='resultado'):
     caminho_html = salvar_html(produtos, nome_arquivo)
     caminho_pdf = caminho_html.replace('.html', '.pdf')
     try:
@@ -529,7 +570,7 @@ def salvar_html(produtos, nome_arquivo='resultado'):
             const classificacao = document.getElementById('selectClassificacao').value;
             if (!classificacao || !codigoSelecionado) return;
 
-            fetch(`https://wht-ml-scraper-default-rtdb.firebaseio.com/whtbase/classification/${codigoSelecionado}.json`, {
+            fetch(`https://wht-ml-scraper-default-rtdb.firebaseio.com/whtbase/class_prod/${codigoSelecionado}.json`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ classificacao: classificacao })
@@ -569,7 +610,6 @@ def salvar_html(produtos, nome_arquivo='resultado'):
 
 # =================== COMUNICAÇÃO ===================
 
-def enviar_para_google_drive(caminho_local, pasta_remota='WHTAutomacao'):
     nome_arquivo = os.path.basename(caminho_local)
     destino = f"{pasta_remota}:{nome_arquivo}"
     try:
@@ -639,8 +679,7 @@ def enviar_resumo_whatsapp_classificacoes(produtos, novos_produtos=None):
     wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, mensagem_final)
     print("[INFO] Resumo geral enviado via WhatsApp.")
 
-from datetime import datetime
-from collections import defaultdict
+# =================== COMPARAÇÃO ===================
 
 def enviar_resumo_whatsapp_parcelas(produtos):
     resumo = defaultdict(list)
@@ -654,7 +693,6 @@ def enviar_resumo_whatsapp_parcelas(produtos):
         valor_parcela = info.get('valor_parcela', '-')
         cupom = info.get('cupom', '-')
 
-        # Converte a string da parcela para número para ordenação
         try:
             valor_float = float(valor_parcela.replace('.', '').replace(',', '.'))
         except:
@@ -671,8 +709,9 @@ def enviar_resumo_whatsapp_parcelas(produtos):
 
     for classe in sorted(resumo.keys()):
         top3 = sorted(resumo[classe], key=lambda x: x['valor'])[:3]
-        linha = '\t'.join([p['texto'] for p in top3])
-        mensagens.append(f"{classe}\t{linha}")
+        textos = [p['texto'] for p in top3]
+        linha_formatada = "  |  ".join(textos)  # quatro espaços
+        mensagens.append(f"{classe}: \t{linha_formatada}")
 
     mensagens.append("https://whtmon-frontend-h8g9chtl0-paulilios-projects.vercel.app/")
 
@@ -682,8 +721,29 @@ def enviar_resumo_whatsapp_parcelas(produtos):
     wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, mensagem_final)
     print("[INFO] Resumo de parcelas enviado via WhatsApp.")
 
+def enviar_resumo_whatsapp_classificacoes(produtos, novos_produtos=None):
+    resumo = defaultdict(list)
+    novos_set = set(novos_produtos) if novos_produtos else set()
 
-# =================== COMPARAÇÃO ===================
+    for produto, info in produtos.items():
+        resumo[info.get('classificacao', 'Não Classificado')].append({
+            'produto': produto,
+            'cupom': info.get('cupom', '-')
+        })
+
+    mensagens = []
+
+    for classe in sorted(resumo.keys()):
+        total = len(resumo[classe])
+        novos_count = sum(1 for item in resumo[classe] if item['produto'] in novos_set)
+        desconto_count = sum(1 for item in resumo[classe] if item.get('cupom', '-') != '-')
+        mensagem = f"{classe}: {total} encontrados. {novos_count} novos. {desconto_count} com desconto."
+        mensagens.append(mensagem)
+
+    mensagem_final = "\n".join(mensagens)
+
+    wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, mensagem_final)
+    print("[INFO] Resumo geral enviado via WhatsApp.")
 
 def carregar_json(caminho_json):
     with open(caminho_json, 'r', encoding='utf-8') as f:
