@@ -144,37 +144,36 @@ def deve_ignorar(titulo, preco, codigo=None):
         return True
     return any(item['produto'].lower() == titulo.lower() for item in IGNORADOS_LOCAIS)
 
-def classificar_produto(titulo, codigo=None, classificacoes_externas=None):
-    if classificacoes_externas and codigo in classificacoes_externas:
-        classificacao_manual = classificacoes_externas[codigo].get('classificacao', "Não Classificado")
-        return "A1 Sem Combo" if classificacao_manual == "A1" else classificacao_manual
+def classificar_produto(titulo, codigo, classificacoes_externas):
+    if codigo in classificacoes_externas:
+        dado = classificacoes_externas[codigo]
+        if isinstance(dado, dict):
+            return dado.get('classificacao', "Não Classificado")
+        else:
+            # Caso seja string ou outro tipo, considerar como manual
+            return dado  # ou: return str(dado) se quiser garantir
+    # Se não houver classificação manual
+    return classificar_automaticamente(titulo)
 
-    titulo_lower = titulo.lower()
+def classificar_automaticamente(titulo):
+    titulo = titulo.lower()
 
-    if 'mini' in titulo_lower:
-        regras = CLASSIFICACAO["A1 Mini"]
-        if any(kw in titulo_lower for kw in regras["sem_combo_keywords"]):
-            return "A1 Mini Sem Combo"
-        if any(kw in titulo_lower for kw in regras["combo_keywords"]):
-            return "A1 Mini Combo"
-        return "A1 Mini"
+    if "p1s" in titulo and "combo" in titulo:
+        return "P1S Combo"
+    if "p1s" in titulo:
+        return "P1S Sem Combo"
 
-    for categoria in ["P1P", "P1S", "A1"]:
-        regras = CLASSIFICACAO.get(categoria, {})
-        if any(kw in titulo_lower for kw in regras.get("combo_keywords", [])):
-            return f"{categoria} Combo"
-        if any(kw in titulo_lower for kw in regras.get("sem_combo_keywords", [])):
-            return f"{categoria} Sem Combo"
-        if any(kw in titulo_lower for kw in regras.get("keywords", [])):
-            return "A1 Sem Combo" if categoria == "A1" else categoria
+    if "a1 mini" in titulo and "combo" in titulo:
+        return "A1 Mini Combo"
+    if "a1 mini" in titulo:
+        return "A1 Mini Sem Combo"
 
-    if "a1" in titulo_lower:
+    if "a1" in titulo and "combo" in titulo:
+        return "A1 Combo"
+    if "a1" in titulo:
         return "A1 Sem Combo"
 
-    if any(ex in titulo_lower for ex in CLASSIFICACAO["Outros"]["exclusoes"]):
-        return "Outros"
-
-    return "Não Classificado"
+    return "Outros"
 
 # =================== COLETA ===================
 
@@ -626,35 +625,6 @@ def enviar_link_whatsapp(link_arquivo):
     message = f"ML Scrapping realizado. Resultado: {link_arquivo}"
     wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, message)
 
-def enviar_resumo_whatsapp_tabela(produtos):
-    resumo = defaultdict(list)
-    for produto, info in produtos.items():
-        resumo[info.get('classificacao', 'Não Classificado')].append({
-            'produto': produto,
-            'preco': info.get('preco', 0),
-            'link_reduzido': info.get('link_reduzido', '#')
-        })
-
-    classes_desejadas = {"P1P", "P1S Sem Combo"}
-
-    mensagens = []
-
-    for classe in sorted(resumo.keys()):
-        if classe not in classes_desejadas:
-            continue
-        mensagens.append("--------------")
-        itens_ordenados = sorted(resumo[classe], key=lambda x: x['preco'])
-        top3 = itens_ordenados[:3]
-        for item in top3:
-            preco = f"R$ {item['preco']:.2f}"
-            link = item['link_reduzido']
-            mensagens.append(f"{classe} {preco} {link}")
-
-    mensagem_final = "\n".join(mensagens)
-
-    wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, mensagem_final)
-    print("[INFO] Resumo filtrado com top 3 menores preços enviado via WhatsApp.")
-
 def enviar_resumo_whatsapp_classificacoes(produtos, novos_produtos=None):
     resumo = defaultdict(list)
     novos_set = set(novos_produtos) if novos_produtos else set()
@@ -678,6 +648,53 @@ def enviar_resumo_whatsapp_classificacoes(produtos, novos_produtos=None):
 
     wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, mensagem_final)
     print("[INFO] Resumo geral enviado via WhatsApp.")
+
+def enviar_resumo_whatsapp_parcelas(produtos):
+    from collections import defaultdict
+    from datetime import datetime
+
+    resumo = defaultdict(list)
+
+    for nome_produto, info in produtos.items():
+        classificacao = info.get('classificacao', 'Não Classificado')
+        if classificacao in ['Não Classificado', 'Outros']:
+            continue
+
+        valor_parcela = info.get('valor_parcela', '-')
+        cupom = info.get('cupom', '-')
+
+        try:
+            valor_float = float(valor_parcela.replace('.', '').replace(',', '.'))
+        except:
+            valor_float = float('inf')
+
+        resumo[classificacao].append({
+            'valor': valor_float,
+            'texto': f"{int(round(valor_float))}{'*' if cupom != '-' else ''}"
+        })
+
+    agora = datetime.now().strftime('%d/%m/%Y, %H:%M:%S')
+    mensagens = [f"Resumo ({agora})", ""]
+
+    for classe in sorted(resumo.keys()):
+        top3 = sorted(resumo[classe], key=lambda x: x['valor'])[:3]
+        textos = [p['texto'] for p in top3]
+        linha_formatada = "    ".join(textos)  # quatro espaços
+        mensagens.append(f"{classe}\t{linha_formatada}")
+
+    mensagens.append("")
+    mensagens.append("https://whtmon-frontend-h8g9chtl0-paulilios-projects.vercel.app/")
+    mensagens.append("")
+    mensagens.append("Observações:")
+    mensagens.append("[1] Asterisco, quando tem valor de cupom.")
+    mensagens.append("[2] O título é Resumo e a data com a hora de execução.")
+    mensagens.append("[3] No final o link do sistema.")
+
+    mensagem_final = "\n".join(mensagens)
+
+    # Envia via WhatsApp
+    wht_send.send_whatsapp_message(env.PHONE, env.API_KEY, mensagem_final)
+    print("[INFO] Resumo de parcelas enviado via WhatsApp.")
 
 # =================== COMPARAÇÃO ===================
 
